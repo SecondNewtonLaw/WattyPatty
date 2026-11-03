@@ -17,222 +17,119 @@
  */
 
 using System.Globalization;
-using PuppeteerSharp;
+using Newtonsoft.Json.Linq;
 using Spectre.Console;
 
 namespace WattyPatty;
 
+/// <summary>
+///     Builds <see cref="StoryMetadata" /> from Wattpad's public v3 API.
+///     A story payload already contains every part (chapter), so no browser navigation is required.
+/// </summary>
 public class MetadataScraper : IScraper<StoryMetadata> {
-    public async Task<StoryMetadata?> ScrapeAsync(IPage page) {
-        var metadata = new StoryMetadata { };
+    private readonly long m_storyIdentifier;
 
-        // //div[@class="story-header"] | Xpath->Header
-        // div.story-header            | QSelector->Header
-        // div.story-header div.story-cover img | QSelector->Header->StoryCover->Img
+    public MetadataScraper(long storyIdentifier) {
+        m_storyIdentifier = storyIdentifier;
+    }
 
-        { // Story Author Name
-            var storyTitle = await page.QuerySelectorAsync("div .story-header>div.story-info>div.author-info>div.author-info__username>a");
-            if (storyTitle == null) {
-                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                return null;
-            }
+    public async Task<StoryMetadata?> ScrapeAsync(WattpadApi api, CancellationToken cancellationToken = default) {
+        var story = await api.GetStoryAsync(m_storyIdentifier, cancellationToken).ConfigureAwait(false);
 
-            metadata.AuthorInformation.AuthorName = await (await storyTitle.GetPropertyAsync("innerText")).JsonValueAsync<string>();
-            // The href is a relative url into /user/xxxxxxxxxxxxxxxxxxx xxxxx being the name of the user.
-            metadata.AuthorInformation.AuthorProfile = new Uri(await (await storyTitle.GetPropertyAsync("href")).JsonValueAsync<string>());
+        if (story is null) {
+            AnsiConsole.MarkupLine($" [orange3][[*]][/] [red]Scraper error![/] Could not fetch story {m_storyIdentifier}.");
+            return null;
         }
 
-        { // Story cover
-            var storyCover = await page.QuerySelectorAsync("div.story-header>div.story-cover>img");
+        var parts = story["parts"] as JArray;
 
-            if (storyCover == null) {
-                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                return null;
-            }
-
-            metadata.StoryImage = new Uri(await (await storyCover.GetPropertyAsync("src")).JsonValueAsync<string>());
-        }
-        // div.story-header div.story-info | QSelector->Header->StoryInfo
-
-        {
-            // div.story-header div.story-info div.paid-indicator | QSelector->Header->StoryInfo->paid-indicator
-            if (await page.QuerySelectorAsync("div.story-header>div.story-info>div.paid-indicator") != null)
-                metadata.IsPaid = true;
+        if (parts is null || parts.Count == 0) {
+            AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/] The story has no readable parts.");
+            return null;
         }
 
-        {
-            var storyTitle = await page.QuerySelectorAsync("div.story-header>div.story-info>div.story-info__title");
-            if (storyTitle == null) {
-                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                return null;
-            }
-
-            metadata.StoryName = await (await storyTitle.GetPropertyAsync("innerText")).JsonValueAsync<string>();
-        }
-
-        { // Story id 
-            // a.card.on-navigate
-            // Hacky way of getting it, we must read the href property and split the string, Nasty, ik.
-
-            var bestRankingOfStory = await page.QuerySelectorAsync("a.card.on-navigate");
-
-            if (bestRankingOfStory == null) {
-                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                return null;
-            }
-
-            metadata.StoryIdentifier = long.Parse((await (await bestRankingOfStory.GetPropertyAsync("href")).JsonValueAsync<string>()).Split("/")[4]);
-        }
-
-        var numberOfChapters = 0L;
-        {
-            // Statistic items
-            // div .story-header div.story-info ul li.stats-item
-
-            var elements = await page.QuerySelectorAllAsync("div.story-header>div.story-info>ul>li.stats-item>span.sr-only");
-
-            if (elements == null || elements.Length == 0) {
-                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                return null;
-            }
-
-            foreach (var element in elements) {
-                var innerText = await (await element.GetPropertyAsync("innerText")).JsonValueAsync<string>();
-
-                if (innerText.Contains("Time")) {
-                    var readTime = string.Join(' ', innerText.Split(' ')[1..]);
-                    metadata.ReadingTime = readTime;
-                    continue;
-                }
-
-                if (innerText.Contains("Parts")) {
-                    innerText = innerText.Split(' ')[1].Replace(",", "").Replace(".", "").Trim();
-                    var mfactor = 1;
-                    if (innerText.Contains("M")) {
-                        innerText = innerText.TrimEnd('M');
-                        mfactor = 1_000_000;
-                    }
-                    else if (innerText.Contains("K")) {
-                        innerText = innerText.TrimEnd('K');
-                        mfactor = 1_000;
-                    }
-
-                    numberOfChapters = long.Parse(innerText) * mfactor;
-                    continue;
-                }
-
-                if (innerText.Contains("Votes")) {
-                    innerText = innerText.Split(' ')[1].Replace(",", "").Replace(".", "").Trim();
-                    var mfactor = 1;
-                    if (innerText.Contains("M")) {
-                        innerText = innerText.TrimEnd('M');
-                        mfactor = 1_000_000;
-                    }
-                    else if (innerText.Contains("K")) {
-                        innerText = innerText.TrimEnd('K');
-                        mfactor = 1_000;
-                    }
-
-                    metadata.StarCount = long.Parse(innerText) * mfactor;
-                    continue;
-                }
-
-                if (innerText.Contains("Reads")) {
-                    innerText = innerText.Split(' ')[1].Replace(",", "").Replace(".", "").Trim();
-                    var mfactor = 1;
-                    if (innerText.Contains("M")) {
-                        innerText = innerText.TrimEnd('M');
-                        mfactor = 1_000_000;
-                    }
-                    else if (innerText.Contains("K")) {
-                        innerText = innerText.TrimEnd('K');
-                        mfactor = 1_000;
-                    }
-
-                    metadata.ViewCount = long.Parse(innerText) * mfactor;
-                }
-            }
-
-        }
-
-        {
-            List<StoryChapter> chapters = new((int)numberOfChapters);
-
-            // div.story-parts>ul>li>a | Chapter a tag.
-
-            var linkToChapter = await page.QuerySelectorAllAsync("div.story-parts>ul>li>a");
-
-            if (linkToChapter == null || linkToChapter.Length == 0) {
-                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                return null;
-            }
-
-            var chapterNumber = 1; // User facing value; beautify. 
-            foreach (var element in linkToChapter) {
-                var chapterUrl = await (await element.GetPropertyAsync("href")).JsonValueAsync<string>();
-                var chapterName = await (await (await element.QuerySelectorAsync("div.left-container>div.part__label>div.part-title")).GetPropertyAsync("innerText"))
-                    .JsonValueAsync<string>();
-                var wasChapterRecientlyUpdated = await element.QuerySelectorAsync("div.left-container>div.part__label>div.icon-container>span") != null;
-                var releaseDate = await element.QuerySelectorAsync("div.right-label"); // The QuerySelector calls on an element are relative to it.
-
-                if (releaseDate == null) {
-                    AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                    chapterNumber++;
-                    continue;
-                }
-
-                var date = (await (await releaseDate.GetPropertyAsync("innerText")).JsonValueAsync<string>());
-                var fixedDate = ""; // Small workaround to non-standard date names.
-
-                {
-                    date = date.Replace("Locked", "");
-
-                    if (date.Contains(" hours ago")) {
-                        // Fix string.
-                        var hour = date.Split(' ')[0];
-                        date = DateTimeOffset.Now.AddHours(-int.Parse(hour)).ToString();
-                    }
-
-                    fixedDate = date;
-                }
-
-                var chapter = new StoryChapter {
-                    ChapterLink = new Uri($"{chapterUrl}"),
-                    ChapterNumber = chapterNumber,
-                    ChapterName = chapterName,
-                    ReleaseDateAsString = date, // This is required becuase of "Paid" stories having this bullshit, lmao.
-                    ReleaseDate = null,
-                    ChapterPageCount = -1, // TBI.
-                    IsNewChapter = wasChapterRecientlyUpdated,
-                };
-
-                if (DateTimeOffset.TryParse(fixedDate, out var releaseDateAsDateOffset))
-                    chapter.ReleaseDate = releaseDateAsDateOffset; // This is optional, and therefore not enforced.
-
-                chapterNumber++;
-                chapters.Add(chapter);
-            }
-
-            metadata.Chapters = chapters;
-        }
-
-        { // Initial release date.
-            // div.story-badges>span.sr-only
-            var storyProgressStatus = await page.QuerySelectorAsync("div.story-badges>div.completed>div.tag-item");
-
-            if (storyProgressStatus == null) {
-                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Scraper error![/]");
-                return null;
-            }
-
-            var storyStatus = await (await storyProgressStatus.GetPropertyAsync("innerText")).JsonValueAsync<string>();
-            metadata.IsOnProgress = storyStatus == "Ongoing"; // Story is on going, aka on progress.
-
-            var publishDateElement = (await page.QuerySelectorAsync("div.story-badges>div#publish-date>strong"));
-            var publishDate = await (await publishDateElement.GetPropertyAsync("innerHTML")).JsonValueAsync<string>();
-            metadata.FirstPublishedAt = DateTimeOffset.Parse(publishDate);
-        }
+        var author = story["user"];
+        var metadata = new StoryMetadata {
+            StoryIdentifier = story.Value<long>("id"),
+            StoryName = story.Value<string>("title") ?? "Unknown",
+            StoryImage = TryCreateUri(story.Value<string>("cover")),
+            IsPaid = story.Value<bool?>("isPaywalled") ?? false,
+            IsOnProgress = !(story.Value<bool?>("completed") ?? false),
+            ViewCount = story.Value<long?>("readCount") ?? 0,
+            StarCount = story.Value<long?>("voteCount") ?? 0,
+            ReadingTime = FormatReadingTime(story.Value<long?>("length") ?? 0),
+            FirstPublishedAt = ParseDate(story["firstPublishedPart"]?.Value<string>("createDate"))
+                              ?? ParseDate(story.Value<string>("createDate"))
+                              ?? default,
+            AuthorInformation = new Author {
+                AuthorName = author?.Value<string>("name") ?? "Unknown",
+                AuthorProfile = TryCreateUri(author?.Value<string>("username") is { } username
+                    ? $"https://www.wattpad.com/user/{username}"
+                    : null),
+            },
+            Chapters = BuildChapters(parts),
+        };
 
         return metadata;
+    }
+
+    private static List<StoryChapter> BuildChapters(JArray parts) {
+        var chapters = new List<StoryChapter>(parts.Count);
+        long chapterNumber = 1;
+
+        foreach (var part in parts) {
+            var releaseDateAsString = part.Value<string>("createDate") ?? "Unknown";
+
+            chapters.Add(new StoryChapter {
+                ChapterIdentifier = part.Value<long>("id"),
+                ChapterLink = TryCreateUri(part.Value<string>("url")),
+                ChapterNumber = chapterNumber++,
+                ChapterName = part.Value<string>("title") ?? "Untitled",
+                ChapterPageCount = 0, // Filled in by ChapterScraper once the text is downloaded.
+                ReleaseDateAsString = releaseDateAsString,
+                ReleaseDate = ParseDate(releaseDateAsString),
+                IsNewChapter = part.Value<bool?>("isNew") ?? false,
+                ReadCount = part.Value<long?>("readCount") ?? 0,
+                VoteCount = part.Value<long?>("voteCount") ?? 0,
+                CommentCount = part.Value<long?>("commentCount") ?? 0,
+                StoryText = null,
+            });
+        }
+
+        return chapters;
+    }
+
+    /// <summary>
+    ///     Wattpad reports the story length in characters. Their reader assumes roughly 5 characters per word and
+    ///     200 words per minute, so mirror that to obtain a comparable "reading time".
+    /// </summary>
+    private static string FormatReadingTime(long characterCount) {
+        if (characterCount <= 0)
+            return "Unknown";
+
+        var minutes = (long)Math.Ceiling(characterCount / 5.0 / 200.0);
+        if (minutes < 60)
+            return $"{minutes} mins";
+
+        var hours = minutes / 60;
+        var remainingMinutes = minutes % 60;
+        var hourLabel = hours == 1 ? "hour" : "hours";
+        return remainingMinutes == 0
+            ? $"{hours} {hourLabel}"
+            : $"{hours} {hourLabel} {remainingMinutes} mins";
+    }
+
+    private static DateTimeOffset? ParseDate(string? value) {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        return DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static Uri TryCreateUri(string? value) {
+        return Uri.TryCreate(value, UriKind.Absolute, out var uri) ? uri : new Uri("https://www.wattpad.com/");
     }
 }

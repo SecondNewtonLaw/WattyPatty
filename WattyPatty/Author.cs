@@ -18,7 +18,7 @@
 namespace WattyPatty;
 
 public class Author {
-    public string AuthorName { get; set; }
+    public string AuthorName { get; set; } = string.Empty;
 
-    public Uri AuthorProfile { get; set; }
+    public Uri AuthorProfile { get; set; } = new("https://www.wattpad.com/");
 }

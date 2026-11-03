@@ -15,152 +15,114 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-using System.Text;
-using PuppeteerSharp;
+
+using System.Collections.Concurrent;
 using Spectre.Console;
 
 namespace WattyPatty;
 
+/// <summary>
+///     Downloads every chapter body through the public <c>apiv2 storytext</c> endpoint.
+///     Chapter statistics (reads, votes, comments) are already provided by the story payload.
+/// </summary>
 public class ChapterScraper : IScraper<StoryMetadata> {
-    private StoryMetadata m_storyMetadata;
-    private HttpClient m_httpClient;
+    /// <summary>
+    ///     Chapters are fetched in parallel. Wattpad's rate limiter is handled globally by <see cref="WattpadApi" />.
+    /// </summary>
+    public const int DefaultMaxConcurrency = 4;
+
+    private readonly StoryMetadata m_storyMetadata;
+    private readonly int m_maxConcurrency;
+
     /// <summary>
     ///     Construct a Chapter scraper for the given story metadata. Will mutate the given story metadata.
     /// </summary>
     /// <param name="metadata"></param>
-    public ChapterScraper(in StoryMetadata metadata, in HttpClient client) {
+    /// <param name="maxConcurrency">How many chapters to download at the same time.</param>
+    public ChapterScraper(in StoryMetadata metadata, int maxConcurrency = DefaultMaxConcurrency) {
         m_storyMetadata = metadata;
-        m_httpClient = client;
-    }
-    public async Task<StoryMetadata?> ScrapeAsync(IPage page) {
-        var storyMetadata = m_storyMetadata;
-        var oldLink = page.Url;
-        var chapterCount = storyMetadata.Chapters.Count();
-        for (var i = 0; i < chapterCount; i++) {
-            var j = i;
-            var redirectTo = storyMetadata.Chapters.ElementAt(j).ChapterLink.AbsoluteUri;
-            AnsiConsole.MarkupLine($" [green][[-]][/] Extended Chapter Data Scrape [[[yellow]{i + 1}[/] of [green]{chapterCount + 1}[/]]]");
-            AnsiConsole.MarkupLine($" [green][[-]][/] Changing Location from {page.Url} to {redirectTo}");
-            await page.GoToAsync(redirectTo);
-            await CompleteChapterInformation(page, storyMetadata, storyMetadata.Chapters.ElementAt(j)); // Classes are always ref types.
-        }
-
-        var navPromise = page.WaitForNavigationAsync();
-        await page.GoToAsync(oldLink);
-        await navPromise;
-
-        return storyMetadata;
+        m_maxConcurrency = Math.Max(1, maxConcurrency);
     }
 
-    public async Task CompleteChapterInformation(IPage page, StoryMetadata storyMetadata, StoryChapter chapter) {
-        // Process the views, votes and comments on the start (for ordering)
+    public async Task<StoryMetadata?> ScrapeAsync(WattpadApi api, CancellationToken cancellationToken = default) {
+        var chapters = m_storyMetadata.Chapters.ToList();
 
-        // Reads QSelector div.story-stats>span.reads
-        // Votes QSelector div.story-stats>span.votes
-        // Comments QSelector div.story-stats>span.comments>a
+        // "safe_for": 1 == brand safe, 0 == NOT brand safe. Fall back to the story payload when unavailable.
+        var isBrandSafe = await api.IsBrandSafeAsync(m_storyMetadata.StoryIdentifier, cancellationToken)
+            .ConfigureAwait(false);
 
-        // Get chapter identifier 
-        {
-            // Cleaner version, couldn't get it working as attempting to access the data-part-id was a failure on many attempts.
-            //var storyPartsContainer = await page.QuerySelectorAsync("article[data-part-id]");
-            //var s = await (await storyPartsContainer.GetPropertyAsync("data-part-id")).JsonValueAsync();
+        var chapterCount = chapters.Count;
+        AnsiConsole.MarkupLine(
+            $" [green][[-]][/] Downloading [green]{chapterCount}[/] chapter(s) for [yellow]{Markup.Escape(m_storyMetadata.StoryName)}[/] using [green]{m_maxConcurrency}[/] parallel request(s)...");
 
-            chapter.ChapterIdentifier = long.Parse(page.Url.Split('/')[3].Split('-')[0]);
+        using var throttle = new SemaphoreSlim(m_maxConcurrency, m_maxConcurrency);
+        var failures = new ConcurrentBag<StoryChapter>();
+        var completed = 0;
+
+        var downloads = chapters.Select(async chapter => {
+            await throttle.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+            try {
+                if (api.IsRateLimited) {
+                    failures.Add(chapter);
+                    return;
+                }
+
+                var (text, pageCount) = await api.GetPartTextAsync(chapter.ChapterIdentifier, cancellationToken)
+                    .ConfigureAwait(false);
+
+                chapter.StoryText = text;
+                chapter.ChapterPageCount = pageCount;
+
+                if (isBrandSafe.HasValue)
+                    chapter.IsNsfw = !isBrandSafe.Value;
+
+                var index = Interlocked.Increment(ref completed);
+
+                lock (ConsoleSynchronization.Gate) {
+                    if (string.IsNullOrEmpty(text)) {
+                        failures.Add(chapter);
+                        AnsiConsole.MarkupLine(
+                            $" [orange3][[*]][/] [red]Chapter {chapter.ChapterNumber} returned no text.[/] [grey]{Markup.Escape(chapter.ChapterName)}[/]");
+                    }
+                    else {
+                        AnsiConsole.MarkupLine(
+                            $" [green][[-]][/] Downloaded [[[yellow]{index}[/] of [green]{chapterCount}[/]]] [grey]{Markup.Escape(chapter.ChapterName)}[/] [grey]({pageCount} page(s), {text.Length} chars)[/]");
+                    }
+                }
+            }
+            catch (OperationCanceledException) {
+                throw;
+            }
+            catch (Exception exception) {
+                failures.Add(chapter);
+
+                lock (ConsoleSynchronization.Gate) {
+                    AnsiConsole.MarkupLine(
+                        $" [orange3][[*]][/] [red]Could not download chapter {chapter.ChapterNumber}[/] [grey]{Markup.Escape(chapter.ChapterName)}[/]: {Markup.Escape(exception.Message)}");
+                }
+            }
+            finally {
+                throttle.Release();
+            }
+        });
+
+        await Task.WhenAll(downloads).ConfigureAwait(false);
+
+        m_storyMetadata.Chapters = chapters;
+
+        if (!failures.IsEmpty) {
+            var failedNumbers = string.Join(", ", failures.OrderBy(chapter => chapter.ChapterNumber)
+                .Select(chapter => chapter.ChapterNumber));
+
+            if (api.IsRateLimited)
+                AnsiConsole.MarkupLine(
+                    $" [orange3][[*]][/] [red]Wattpad rate limited this client, so {failures.Count} chapter(s) were not downloaded.[/] Try again in a few minutes; the rest of the story was archived normally.");
+
+            AnsiConsole.MarkupLine(
+                $" [orange3][[*]][/] [red]{failures.Count} chapter(s) could not be downloaded[/] (chapter(s) {Markup.Escape(failedNumbers)}). They are marked as not retrieved in the output.");
         }
 
-        #region Story Stats Scrape
-
-        {
-            var readsElement = await page.QuerySelectorAsync("div.story-stats>span.reads");
-            if (readsElement == null)
-                throw new Exception("Invalid reads scrape");
-
-            var txt = await (await readsElement.GetPropertyAsync("innerText")).JsonValueAsync<string>();
-            txt = txt.Replace(",", "").Replace(".", "").Trim();
-            var mfactor = 1;
-            if (txt.Contains("M")) {
-                txt = txt.TrimEnd('M');
-                mfactor = 1_000_000;
-            }
-            else if (txt.Contains("K")) {
-                txt = txt.TrimEnd('K');
-                mfactor = 1_000;
-            }
-
-            chapter.ReadCount = long.Parse(txt) * mfactor;
-
-        }
-
-        {
-            var votesElements = await page.QuerySelectorAsync("div.story-stats>span.votes");
-            if (votesElements == null)
-                throw new Exception("Invalid votes scrape");
-
-
-            var txt = await (await votesElements.GetPropertyAsync("innerText")).JsonValueAsync<string>();
-            txt = txt.Replace(",", "").Replace(".", "").Trim();
-            var mfactor = 1;
-            if (txt.Contains("M")) {
-                txt = txt.TrimEnd('M');
-                mfactor = 1_000_000;
-            }
-            else if (txt.Contains("K")) {
-                txt = txt.TrimEnd('K');
-                mfactor = 1_000;
-            }
-
-            chapter.VoteCount = long.Parse(txt) * mfactor;
-        }
-
-        {
-            var commentsElement = await page.QuerySelectorAsync("div.story-stats>span.comments>a");
-            if (commentsElement == null)
-                throw new Exception("Invalid reads comments");
-
-            var txt = await (await commentsElement.GetPropertyAsync("innerText")).JsonValueAsync<string>();
-            txt = txt.Replace(",", "").Replace(".", "").Trim();
-            var mfactor = 1;
-            if (txt.Contains("M")) {
-                txt = txt.TrimEnd('M');
-                mfactor = 1_000_000;
-            }
-            else if (txt.Contains("K")) {
-                txt = txt.TrimEnd('K');
-                mfactor = 1_000;
-            }
-
-            chapter.CommentCount = long.Parse(txt) * mfactor;
-        }
-
-        #endregion Story Stats Scrape
-
-        // pre>p | Story text chunks
-
-
-        // Whether or not the story is nsfw.
-
-        // https://www.wattpad.com/v5/stories/{STORY_ID}/classification/safety
-        chapter.IsNsfw = !(await (await m_httpClient.GetAsync($"https://www.wattpad.com/v5/stories/{storyMetadata.StoryIdentifier}/classification/safety")).Content
-            .ReadAsStringAsync()).Contains("1", StringComparison.InvariantCultureIgnoreCase); // Safe for 1 == brand safe | Safe for 0 == NOT brand safe.
-
-        // We can use the undocumented api endpoint -> https://www.wattpad.com/apiv2/?m=storytext&id={CHAPTER_ID}&page={PAGE_NUM}
-
-        // Story text, the JUICY part.
-        StringBuilder sb = new();
-
-        var previousLength = -1;
-        var currentPage = 0L;
-
-        while (sb.Length != previousLength) {
-            var response = await m_httpClient.GetAsync($"https://www.wattpad.com/apiv2/?m=storytext&id={chapter.ChapterIdentifier}&page={currentPage}");
-
-            var s = await response.Content.ReadAsStringAsync();
-            previousLength = sb.Length;
-            sb.Append(s);
-            currentPage++;
-        }
-
-        chapter.ChapterPageCount = currentPage;
-        chapter.StoryText = sb.ToString();
+        return m_storyMetadata;
     }
 }

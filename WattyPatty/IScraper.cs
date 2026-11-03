@@ -15,11 +15,9 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-using PuppeteerSharp;
 
 namespace WattyPatty;
 
-interface IScraper<T> {
-    public T? Scrape(IPage page) => ScrapeAsync(page).Result;
-    public Task<T?> ScrapeAsync(IPage page);
+public interface IScraper<T> {
+    public Task<T?> ScrapeAsync(WattpadApi api, CancellationToken cancellationToken = default);
 }

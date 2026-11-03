@@ -15,141 +15,111 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
 using System.Diagnostics;
-using System.Globalization;
-using System.Net;
-using System.Security.Authentication;
 using Newtonsoft.Json;
-using PuppeteerExtraSharp;
-using PuppeteerExtraSharp.Plugins.AnonymizeUa;
-using PuppeteerExtraSharp.Plugins.BlockResources;
-using PuppeteerExtraSharp.Plugins.ExtraStealth;
-using PuppeteerSharp;
 using Spectre.Console;
 
 namespace WattyPatty;
 
 public class MainActivity {
-    private static async Task ObtainPrerequisites() {
-        Console.WriteLine("Obtaining Browser...");
-        var fetcher = new BrowserFetcher();
-        var browser = await fetcher.DownloadAsync();
-        Console.WriteLine($"Obtained Browser: {browser.Browser} for {browser.Platform} | BID: {browser.BuildId}");
-    }
+    private const string MetadataDirectory = "output";
+    private const string MetadataFileName = "meta.json";
 
     private static async Task Main(string[] args) {
         AnsiConsole.MarkupLine("\t-----------------------------------------");
         AnsiConsole.MarkupLine("\t| [white]WattyPatty[/] - [orangered1]Wattpad[/] Story [green]Downloader[/] |");
         AnsiConsole.MarkupLine("\t-----------------------------------------");
 
-        AnsiConsole.MarkupLine(" [green][[-]][/] Obtaining Pre-Requisites...");
-        await ObtainPrerequisites();
+        var storyUrl = args.Length > 0
+            ? args[0]
+            : AnsiConsole.Ask<string>(" [green][[+]][/] Please input the story you want to download:");
 
-        AnsiConsole.MarkupLine(" [green][[-]][/] Obtained Pre-Requisites.");
-
-        AnsiConsole.Markup(" [green][[+]][/] Please input the story you want to download:");
-
-        var storyUrl = AnsiConsole.Ask<string>(" ");
-
-        if (!Uri.TryCreate(storyUrl, UriKind.RelativeOrAbsolute, out var parsedUri) || !storyUrl.Contains("https://www.wattpad.com/")) {
+        if (!Uri.TryCreate(storyUrl, UriKind.Absolute, out var parsedUri) ||
+            !parsedUri.Host.EndsWith("wattpad.com", StringComparison.OrdinalIgnoreCase)) {
             AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Invalid url![/]");
             return;
         }
 
-        AnsiConsole.MarkupLine(" [green][[-]][/] Launching Browser...");
-
-        var extraPuppeteer = new PuppeteerExtra();
-        extraPuppeteer.Use(new StealthPlugin());
-        extraPuppeteer.Use(new AnonymizeUaPlugin());
-        // extraPuppeteer.Use(new BlockResourcesPlugin());
-        var browser = await extraPuppeteer.LaunchAsync(new LaunchOptions {
-            Headless = true, Args = [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-infobars",
-                "--no-zygote",
-                "--no-first-run",
-                "--ignore-certificate-errors",
-                "--ignore-certificate-errors-skip-list",
-                "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--disable-gpu",
-                "--hide-scrollbars",
-                "--disable-notifications",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-breakpad",
-                "--disable-component-extensions-with-background-pages",
-                "--disable-extensions",
-                "--disable-features=TranslateUI,BlinkGenPropertyTrees",
-                "--disable-ipc-flooding-protection",
-                "--disable-renderer-backgrounding",
-                "--enable-features=NetworkService,NetworkServiceInProcess",
-                "--force-color-profile=srgb",
-                "--metrics-recording-only",
-                "--mute-audio",
-            ]
-        });
-
-        AnsiConsole.MarkupLine(" [green][[-]][/] Launched browser on headless mode!");
-
-        AnsiConsole.MarkupLine(" [green][[-]][/] Navigating to site and scraping Metadata...");
-
-        await Task.Delay(500);
-
-        var pages = await browser.PagesAsync();
-        var selectedPage = (IPage)default;
-
-        if (pages != null && pages.Length != 0)
-            selectedPage = pages[0];
-        else
-            selectedPage = await browser.NewPageAsync();
-
-        await selectedPage.SetRequestInterceptionAsync(true);
-        selectedPage.Request += async (sender, eventArgs) => {
-            if (eventArgs.Request.ResourceType is ResourceType.Font or ResourceType.StyleSheet or ResourceType.Image or ResourceType.ImageSet
-                    or ResourceType.Img || eventArgs.Request.ResourceType == ResourceType.Script && !eventArgs.Request.Url.Contains("wattpad.com")) {
-                await eventArgs.Request.AbortAsync();
-            }
-            else
-                await eventArgs.Request.ContinueAsync();
+        using var api = new WattpadApi {
+            DiagnosticMessage = message => {
+                lock (ConsoleSynchronization.Gate)
+                    AnsiConsole.MarkupLine($" [orange3][[*]][/] [yellow]{Markup.Escape(message)}[/]");
+            },
         };
-        AnsiConsole.MarkupLine($" [green][[-]][/] Changing Location from {selectedPage.Url} to {parsedUri.AbsoluteUri}");
-        var navigationTask = selectedPage.WaitForNavigationAsync();
-        await selectedPage.GoToAsync(parsedUri.AbsoluteUri);
-        await navigationTask;
+        using var cancellationTokenSource = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) => {
+            eventArgs.Cancel = true;
+            cancellationTokenSource.Cancel();
+        };
 
-        AnsiConsole.MarkupLine(" [green][[-]][/] Scraping metadata...");
+        var cancellationToken = cancellationTokenSource.Token;
 
-        var httpClient = new HttpClient(new HttpClientHandler() { SslProtocols = SslProtocols.Tls12, AutomaticDecompression = DecompressionMethods.All });
+        try {
+            AnsiConsole.MarkupLine(" [green][[-]][/] Resolving story identifier...");
 
-        var metadataScraper = new MetadataScraper();
+            var storyIdentifier = await api.ResolveStoryIdentifierAsync(parsedUri, cancellationToken);
+            if (storyIdentifier is null) {
+                AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Error! The given url does not belong to a Wattpad story.[/]");
+                return;
+            }
 
-        var storyMetadata = await metadataScraper.ScrapeAsync(selectedPage);
+            AnsiConsole.MarkupLine($" [green][[-]][/] Scraping metadata for story [yellow]{storyIdentifier}[/]...");
 
-        if (storyMetadata == null) {
+            var metadataScraper = new MetadataScraper(storyIdentifier.Value);
+            var storyMetadata = await metadataScraper.ScrapeAsync(api, cancellationToken);
+
+            if (storyMetadata is null) {
+                AnsiConsole.MarkupLine(
+                    " [orange3][[*]][/] [red]Error! The scraper has failed, if Wattpad has changed their API, then this will no longer work...[/]");
+                return;
+            }
+
+            PrintSummary(storyMetadata);
+
+            AnsiConsole.MarkupLine(" [green][[-]][/] Downloading all chapters, this will take a while...");
+            var watch = Stopwatch.StartNew();
+
+            var chapterProcessor = new ChapterScraper(in storyMetadata);
+            await chapterProcessor.ScrapeAsync(api, cancellationToken);
+            watch.Stop();
+
+            var outputDirectory = Path.Combine(Directory.GetCurrentDirectory(), MetadataDirectory);
+            Directory.CreateDirectory(outputDirectory);
+
+            AnsiConsole.MarkupLine(" [green][[-]][/] Writing metadata and Markdown...");
+
+            var metadataPath = Path.Combine(outputDirectory, MetadataFileName);
+            await File.WriteAllTextAsync(metadataPath, JsonConvert.SerializeObject(storyMetadata, Formatting.Indented),
+                cancellationToken);
+            var markdownPath = await MarkdownExporter.WriteAsync(storyMetadata, outputDirectory, cancellationToken);
+
             AnsiConsole.MarkupLine(
-                " [orange3][[*]][/] [red]Error! The scraper has failed, if Wattpad has updated their front-end, then this will no longer work...[/]");
-            return;
+                $" [green][[-]][/] The metadata has been written to disk as [yellow]{Markup.Escape(metadataPath)}[/].");
+            AnsiConsole.MarkupLine(
+                $" [green][[-]][/] The story has been written as Markdown to [yellow]{Markup.Escape(markdownPath)}[/].");
+            AnsiConsole.MarkupLine($" [yellow][[-]][/] Extended story scrape completed in {watch.ElapsedMilliseconds}ms!");
         }
+        catch (OperationCanceledException) {
+            AnsiConsole.MarkupLine(" [orange3][[*]][/] [red]Cancelled by the user.[/]");
+        }
+        catch (Exception exception) {
+            AnsiConsole.MarkupLine($" [orange3][[*]][/] [red]Unexpected error:[/] {Markup.Escape(exception.Message)}");
+        }
+    }
 
-        AnsiConsole.MarkupLine(" [green][[-]][/] Metadata scrape completed.");
-
-        AnsiConsole.MarkupLine(" [green][[-]][/] Completing all metadata and downloading chapters, this will take a while...");
-        var watch = Stopwatch.StartNew();
-
-        var chapterProcessor = new ChapterScraper(in storyMetadata, in httpClient);
-        await chapterProcessor.ScrapeAsync(selectedPage);
-
-        AnsiConsole.MarkupLine(" [green][[-]][/] Writing metadata...");
-
-        await File.WriteAllTextAsync("meta.json", JsonConvert.SerializeObject(storyMetadata, Formatting.Indented));
-
-        AnsiConsole.MarkupLine(" [green][[-]][/] The metadata has been written to disk as meta.json. You may reconstruct the story from this metadata.");
-
-        await browser.CloseAsync();
-        httpClient.Dispose();
-
-        AnsiConsole.MarkupLine($" [yellow][[-]][/] Extended story scrape completed in {watch.ElapsedMilliseconds}ms!");
+    private static void PrintSummary(StoryMetadata storyMetadata) {
+        var table = new Table().Border(TableBorder.Rounded).HideHeaders();
+        table.AddColumn("Field");
+        table.AddColumn("Value");
+        table.AddRow("Title", Markup.Escape(storyMetadata.StoryName));
+        table.AddRow("Author", Markup.Escape(storyMetadata.AuthorInformation.AuthorName));
+        table.AddRow("Chapters", storyMetadata.Chapters.Count().ToString());
+        table.AddRow("Reads", storyMetadata.ViewCount.ToString());
+        table.AddRow("Votes", storyMetadata.StarCount.ToString());
+        table.AddRow("Reading time", Markup.Escape(storyMetadata.ReadingTime));
+        table.AddRow("Status", storyMetadata.IsOnProgress ? "Ongoing" : "Completed");
+        table.AddRow("Paid", storyMetadata.IsPaid ? "Yes" : "No");
+        AnsiConsole.Write(table);
     }
 }
